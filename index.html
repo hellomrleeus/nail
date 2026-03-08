@@ -31,6 +31,12 @@
   <div class="panel">
     <div class="chips" id="chips"></div>
     <div class="right">
+      <label>镜头
+        <select id="cameraFacing">
+          <option value="environment" selected>后置</option>
+          <option value="user">前置</option>
+        </select>
+      </label>
       <label>风格
         <select id="style">
           <option value="solid">纯色</option>
@@ -53,6 +59,7 @@ const ctx = canvas.getContext('2d');
 const statusEl = document.getElementById('status');
 const styleEl = document.getElementById('style');
 const glossEl = document.getElementById('gloss');
+const cameraFacingEl = document.getElementById('cameraFacing');
 
 const palette = ['#ff4f9a','#d14dff','#7f63ff','#3aa0ff','#12c9b2','#ff8a3d','#f44336','#7e57c2','#00acc1','#c0ca33'];
 let nailColor = palette[0];
@@ -79,10 +86,11 @@ const fingerIdx = {
 const order = ['thumb','index','middle','ring','little'];
 const slots = Array(5).fill(null);
 const miss = Array(5).fill(0);
+let currentStream = null;
+let sending = false;
 
 function clamp(v,a,b){ return Math.max(a,Math.min(b,v)); }
-function adaptiveAlpha(d){ if(d>0.035) return 0.62; if(d>0.015) return 0.45; return 0.30; }
-
+function adaptiveAlpha(d){ if(d>0.035) return 0.70; if(d>0.015) return 0.48; return 0.30; }
 function vec(a,b){ return {x:a.x-b.x, y:a.y-b.y}; }
 function len(v){ return Math.hypot(v.x,v.y) || 1e-6; }
 
@@ -92,17 +100,42 @@ function estimateRects(lm){
     const [tip,dip,pip] = fingerIdx[f];
     const t = lm[tip], d = lm[dip], p = lm[pip];
     if(!t||!d||!p) return;
+
     const v = vec(t,d);
     const L = len(v);
-    const ux = v.x/L, uy=v.y/L;
-    const w = clamp(L*0.58, 0.018, 0.07);
-    const h = clamp(w*1.42, 0.026, 0.11);
-    const cx = t.x + ux*h*0.13;
-    const cy = t.y + uy*h*0.13;
+    const ux = v.x/L, uy = v.y/L;
+
+    // 用 PIP-DIP 估计指宽，减少跳动
+    const widthV = vec(d,p);
+    const widthBase = len(widthV);
+
+    const w = clamp(Math.max(L*0.52, widthBase*0.40), 0.016, 0.065);
+    const h = clamp(w*1.35, 0.024, 0.095);
+
+    const cx = t.x + ux*h*0.10;
+    const cy = t.y + uy*h*0.10;
     const angle = Math.atan2(uy, ux) + Math.PI/2;
     rects[i] = {cx,cy,w,h,angle};
   });
   return rects;
+}
+
+function palmFacingScore(lm){
+  // 经验分数：>0 越像掌心朝向镜头（用于抑制“掌心也涂甲”）
+  const tips = [4,8,12,16,20];
+  const dips = [3,7,11,15,19];
+  let zVotes = 0;
+  for(let i=0;i<tips.length;i++){
+    const t = lm[tips[i]], d = lm[dips[i]];
+    if(!t||!d) continue;
+    if(t.z < d.z) zVotes += 1; // 指尖更靠近镜头
+  }
+
+  const a = lm[0], b = lm[5], c = lm[17];
+  const orient = ((b.x-a.x)*(c.y-a.y) - (b.y-a.y)*(c.x-a.x));
+
+  // 组合两个信号：zVotes + 掌面朝向二维符号
+  return zVotes/5 + (orient > 0 ? 0.35 : -0.35);
 }
 
 function smooth(current){
@@ -121,7 +154,7 @@ function smooth(current){
       };
       miss[i]=0;
     } else if(c && !p){ out[i]=c; miss[i]=0; }
-    else if(!c && p){ miss[i]++; out[i]= miss[i]<=5 ? p : null; }
+    else if(!c && p){ miss[i]++; out[i]= miss[i]<=3 ? p : null; }
     else out[i]=null;
   }
   for(let i=0;i<5;i++) slots[i]=out[i];
@@ -142,25 +175,25 @@ function drawNail(n){
   if(styleEl.value==='solid'){
     const g = ctx.createLinearGradient(-w/2,-h/2,w/2,h/2);
     g.addColorStop(0, hexToRgba(nailColor, 0.95));
-    g.addColorStop(1, hexToRgba(nailColor, 0.65));
+    g.addColorStop(1, hexToRgba(nailColor, 0.62));
     ctx.fillStyle = g;
     ctx.fill(path);
   } else {
     const base = ctx.createLinearGradient(0,-h/2,0,h/2);
-    base.addColorStop(0, hexToRgba(nailColor, 0.88));
-    base.addColorStop(1, hexToRgba(nailColor, 0.5));
+    base.addColorStop(0, hexToRgba(nailColor, 0.86));
+    base.addColorStop(1, hexToRgba(nailColor, 0.48));
     ctx.fillStyle = base; ctx.fill(path);
 
     const gloss = Number(glossEl.value);
     const cat = ctx.createLinearGradient(-w/2,0,w/2,0);
-    cat.addColorStop(0.25,'rgba(255,255,255,0)');
-    cat.addColorStop(0.5,`rgba(255,255,255,${0.35+0.5*gloss})`);
-    cat.addColorStop(0.75,'rgba(255,255,255,0)');
+    cat.addColorStop(0.22,'rgba(255,255,255,0)');
+    cat.addColorStop(0.5,`rgba(255,255,255,${0.30+0.55*gloss})`);
+    cat.addColorStop(0.78,'rgba(255,255,255,0)');
     ctx.fillStyle = cat; ctx.fill(path);
   }
 
   const gloss = Number(glossEl.value);
-  ctx.strokeStyle = `rgba(255,255,255,${0.2+0.6*gloss})`;
+  ctx.strokeStyle = `rgba(255,255,255,${0.18+0.52*gloss})`;
   ctx.lineWidth = 1;
   ctx.stroke(path);
   ctx.restore();
@@ -177,8 +210,8 @@ const hands = new Hands({locateFile: (f) => `https://cdn.jsdelivr.net/npm/@media
 hands.setOptions({
   maxNumHands: 1,
   modelComplexity: 1,
-  minDetectionConfidence: 0.65,
-  minTrackingConfidence: 0.65
+  minDetectionConfidence: 0.70,
+  minTrackingConfidence: 0.70
 });
 
 hands.onResults((res) => {
@@ -188,27 +221,71 @@ hands.onResults((res) => {
 
   if(!res.multiHandLandmarks || res.multiHandLandmarks.length===0){
     smooth(Array(5).fill(null));
-    statusEl.textContent = '未检测到手，请把手放入镜头';
+    statusEl.textContent = '未检测到手，请把手背放入镜头';
     return;
   }
 
-  statusEl.textContent = '追踪中';
   const lms = res.multiHandLandmarks[0];
+  const palmScore = palmFacingScore(lms);
+
+  // 掌心朝向时不渲染，提升“真实感”
+  if (palmScore > 0.62) {
+    smooth(Array(5).fill(null));
+    statusEl.textContent = '检测到掌心，已隐藏美甲（请翻到手背）';
+    return;
+  }
+
+  statusEl.textContent = '追踪中（手背模式）';
   const rects = estimateRects(lms);
   const smoothed = smooth(rects);
-
   smoothed.forEach(drawNail);
 });
 
-const cam = new Camera(video, {
-  onFrame: async () => { await hands.send({image: video}); },
-  width: 960,
-  height: 720
+async function startCamera(facing = 'environment') {
+  try {
+    if (currentStream) {
+      currentStream.getTracks().forEach(t => t.stop());
+      currentStream = null;
+    }
+
+    const constraints = {
+      audio: false,
+      video: {
+        facingMode: { ideal: facing },
+        width: { ideal: 1280 },
+        height: { ideal: 720 }
+      }
+    };
+
+    currentStream = await navigator.mediaDevices.getUserMedia(constraints);
+    video.srcObject = currentStream;
+    await video.play();
+    statusEl.textContent = `摄像头已启动：${facing === 'environment' ? '后置' : '前置'}`;
+  } catch (err) {
+    statusEl.textContent = '摄像头启动失败：' + err.message;
+  }
+}
+
+async function frameLoop() {
+  if (video.readyState >= 2 && !sending) {
+    sending = true;
+    try { await hands.send({ image: video }); } finally { sending = false; }
+  }
+  requestAnimationFrame(frameLoop);
+}
+
+cameraFacingEl.addEventListener('change', async () => {
+  await startCamera(cameraFacingEl.value);
 });
 
-cam.start().catch(err => {
-  statusEl.textContent = '摄像头启动失败：' + err.message;
-});
+(async () => {
+  if (!navigator.mediaDevices?.getUserMedia) {
+    statusEl.textContent = '当前浏览器不支持摄像头 API（请用 Safari/Chrome 并走 HTTPS）';
+    return;
+  }
+  await startCamera('environment');
+  frameLoop();
+})();
 </script>
 </body>
 </html>
